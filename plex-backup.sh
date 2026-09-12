@@ -12,6 +12,7 @@
 #   INCLUDE_CACHE=0  # Set to 1 to include Plex's rebuildable Cache directory.
 #   RCLONE_DEST=NAtomJZXTR:  # Default remote; set to an empty value to disable upload.
 #   RCLONE_CONFIG=    # Optional path to rclone.conf.
+#   LOCK_FILE=/run/plex-maintenance.lock
 
 set -Eeuo pipefail
 umask 077
@@ -22,17 +23,31 @@ BACKUP_DIR="${BACKUP_DIR:-/var/backups/plex}"
 INCLUDE_CACHE="${INCLUDE_CACHE:-0}"
 RCLONE_DEST="${RCLONE_DEST-NAtomJZXTR:}"
 RCLONE_CONFIG="${RCLONE_CONFIG:-}"
+LOCK_FILE="${LOCK_FILE:-/run/plex-maintenance.lock}"
 
 die() {
     printf 'Error: %s\n' "$*" >&2
     exit 1
 }
 
+remote_path_for() {
+    local file_name="$1"
+
+    if [[ "$RCLONE_DEST" == *: ]]; then
+        printf '%s%s\n' "$RCLONE_DEST" "$file_name"
+    else
+        printf '%s/%s\n' "${RCLONE_DEST%/}" "$file_name"
+    fi
+}
+
 [[ "${EUID}" -eq 0 ]] || die 'run this script as root (for example, with sudo)'
 [[ "$INCLUDE_CACHE" == 0 || "$INCLUDE_CACHE" == 1 ]] || \
     die 'INCLUDE_CACHE must be 0 or 1'
+[[ "$PLEX_DATA_DIR" == /* ]] || die 'PLEX_DATA_DIR must be an absolute path'
+[[ "$LOCK_FILE" == /* ]] || die 'LOCK_FILE must be an absolute path'
 
-for command_name in systemctl tar realpath; do
+for command_name in systemctl tar realpath sha256sum flock mkdir mv rm \
+    date dirname basename; do
     command -v "$command_name" >/dev/null 2>&1 || \
         die "required command not found: $command_name"
 done
@@ -65,19 +80,34 @@ mkdir -p -- "$BACKUP_DIR"
 
 data_dir="$(realpath -e -- "$PLEX_DATA_DIR")"
 backup_dir="$(realpath -e -- "$BACKUP_DIR")"
+[[ "$data_dir" != / ]] || die 'PLEX_DATA_DIR must not be a filesystem root'
 
 case "$backup_dir/" in
     "$data_dir/"*) die 'BACKUP_DIR must not be inside PLEX_DATA_DIR' ;;
 esac
 
+systemctl cat "$PLEX_SERVICE" >/dev/null 2>&1 || \
+    die "systemd service not found: $PLEX_SERVICE"
+
+lock_parent="$(dirname -- "$LOCK_FILE")"
+[[ -d "$lock_parent" ]] || die "lock directory not found: $lock_parent"
+[[ ! -L "$LOCK_FILE" ]] || die "lock file must not be a symbolic link: $LOCK_FILE"
+exec 9>>"$LOCK_FILE"
+flock -n 9 || die "another Plex maintenance operation is running (lock: $LOCK_FILE)"
+
 data_parent="$(dirname -- "$data_dir")"
 data_name="$(basename -- "$data_dir")"
 timestamp="$(date +%Y%m%d-%H%M%S)"
-final_file="$backup_dir/plex-$timestamp-$$.tar.gz"
+backup_name="plex-$timestamp-$$.tar.gz"
+checksum_name="$backup_name.sha256"
+final_file="$backup_dir/$backup_name"
 partial_file="$final_file.partial"
+checksum_file="$backup_dir/$checksum_name"
+partial_checksum="$checksum_file.partial"
 
 was_active=0
 restart_required=0
+local_backup_complete=0
 
 if systemctl is-active --quiet "$PLEX_SERVICE"; then
     was_active=1
@@ -85,20 +115,26 @@ fi
 
 cleanup() {
     exit_status=$?
+    trap - EXIT INT TERM HUP
+    set +e
 
     if [[ "$restart_required" -eq 1 ]]; then
         systemctl start "$PLEX_SERVICE" || \
             printf 'Warning: could not restart %s\n' "$PLEX_SERVICE" >&2
     fi
 
-    if [[ "$exit_status" -ne 0 && -f "$partial_file" ]]; then
-        rm -f -- "$partial_file"
+    rm -f -- "$partial_file" "$partial_checksum"
+    if [[ "$local_backup_complete" -eq 0 ]]; then
+        rm -f -- "$final_file" "$checksum_file"
     fi
 
     exit "$exit_status"
 }
 
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 if [[ "$was_active" -eq 1 ]]; then
     restart_required=1
@@ -124,17 +160,23 @@ printf 'Verifying backup...\n'
 tar -tzf "$partial_file" >/dev/null
 mv -- "$partial_file" "$final_file"
 
-trap - EXIT
+(
+    cd -- "$backup_dir"
+    sha256sum -- "$backup_name" > "$partial_checksum"
+    sha256sum -c -- "$partial_checksum" >/dev/null
+)
+mv -- "$partial_checksum" "$checksum_file"
+local_backup_complete=1
+
 printf 'Local backup complete: %s\n' "$final_file"
+printf 'Checksum complete: %s\n' "$checksum_file"
 
 if [[ -n "$RCLONE_DEST" ]]; then
-    backup_name="$(basename -- "$final_file")"
-    if [[ "$RCLONE_DEST" == *: ]]; then
-        remote_file="${RCLONE_DEST}${backup_name}"
-    else
-        remote_file="${RCLONE_DEST%/}/${backup_name}"
-    fi
-    printf 'Uploading to %s...\n' "$remote_file"
+    remote_file="$(remote_path_for "$backup_name")"
+    remote_checksum="$(remote_path_for "$checksum_name")"
+    printf 'Uploading checksum to %s...\n' "$remote_checksum"
+    rclone "${rclone_options[@]}" copyto "$checksum_file" "$remote_checksum"
+    printf 'Uploading backup to %s...\n' "$remote_file"
     rclone "${rclone_options[@]}" copyto "$final_file" "$remote_file"
     printf 'Upload complete: %s\n' "$remote_file"
 fi
