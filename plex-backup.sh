@@ -128,7 +128,12 @@ trap - EXIT
 printf 'Local backup complete: %s\n' "$final_file"
 
 if [[ -n "$RCLONE_DEST" ]]; then
-    remote_file="${RCLONE_DEST%/}/$(basename -- "$final_file")"
+    backup_name="$(basename -- "$final_file")"
+    if [[ "$RCLONE_DEST" == *: ]]; then
+        remote_file="${RCLONE_DEST}${backup_name}"
+    else
+        remote_file="${RCLONE_DEST%/}/${backup_name}"
+    fi
     printf 'Uploading to %s...\n' "$remote_file"
     rclone "${rclone_options[@]}" copyto "$final_file" "$remote_file"
     printf 'Upload complete: %s\n' "$remote_file"
