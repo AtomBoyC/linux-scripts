@@ -10,7 +10,7 @@
 #   PLEX_DATA_DIR='/var/lib/plexmediaserver/Library/Application Support/Plex Media Server'
 #   BACKUP_DIR=/var/backups/plex
 #   INCLUDE_CACHE=0  # Set to 1 to include Plex's rebuildable Cache directory.
-#   RCLONE_DEST=      # Example: NAtomJZXTR:plex-backups; empty disables upload.
+#   RCLONE_DEST=NAtomJZXTR:  # Default remote; set to an empty value to disable upload.
 #   RCLONE_CONFIG=    # Optional path to rclone.conf.
 
 set -Eeuo pipefail
@@ -20,7 +20,7 @@ PLEX_SERVICE="${PLEX_SERVICE:-plexmediaserver}"
 PLEX_DATA_DIR="${PLEX_DATA_DIR:-/var/lib/plexmediaserver/Library/Application Support/Plex Media Server}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/plex}"
 INCLUDE_CACHE="${INCLUDE_CACHE:-0}"
-RCLONE_DEST="${RCLONE_DEST:-}"
+RCLONE_DEST="${RCLONE_DEST-NAtomJZXTR:}"
 RCLONE_CONFIG="${RCLONE_CONFIG:-}"
 
 die() {
