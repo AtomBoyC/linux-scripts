@@ -10,6 +10,8 @@
 #   PLEX_DATA_DIR='/var/lib/plexmediaserver/Library/Application Support/Plex Media Server'
 #   BACKUP_DIR=/var/backups/plex
 #   INCLUDE_CACHE=0  # Set to 1 to include Plex's rebuildable Cache directory.
+#   RCLONE_DEST=      # Example: NAtomJZXTR:plex-backups; empty disables upload.
+#   RCLONE_CONFIG=    # Optional path to rclone.conf.
 
 set -Eeuo pipefail
 umask 077
@@ -18,6 +20,8 @@ PLEX_SERVICE="${PLEX_SERVICE:-plexmediaserver}"
 PLEX_DATA_DIR="${PLEX_DATA_DIR:-/var/lib/plexmediaserver/Library/Application Support/Plex Media Server}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/plex}"
 INCLUDE_CACHE="${INCLUDE_CACHE:-0}"
+RCLONE_DEST="${RCLONE_DEST:-}"
+RCLONE_CONFIG="${RCLONE_CONFIG:-}"
 
 die() {
     printf 'Error: %s\n' "$*" >&2
@@ -32,6 +36,29 @@ for command_name in systemctl tar realpath; do
     command -v "$command_name" >/dev/null 2>&1 || \
         die "required command not found: $command_name"
 done
+
+rclone_options=()
+if [[ -n "$RCLONE_DEST" ]]; then
+    command -v rclone >/dev/null 2>&1 || die 'required command not found: rclone'
+
+    # sudo normally changes HOME to /root. Reuse the invoking user's standard
+    # rclone configuration when no explicit RCLONE_CONFIG was supplied.
+    if [[ -z "$RCLONE_CONFIG" && -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+        command -v getent >/dev/null 2>&1 || die 'required command not found: getent'
+        passwd_entry="$(getent passwd "$SUDO_USER")" || \
+            die "could not resolve sudo user: $SUDO_USER"
+        IFS=: read -r _ _ _ _ _ sudo_user_home _ <<< "$passwd_entry"
+        candidate_config="$sudo_user_home/.config/rclone/rclone.conf"
+        if [[ -f "$candidate_config" ]]; then
+            RCLONE_CONFIG="$candidate_config"
+        fi
+    fi
+
+    if [[ -n "$RCLONE_CONFIG" ]]; then
+        [[ -r "$RCLONE_CONFIG" ]] || die "rclone config is not readable: $RCLONE_CONFIG"
+        rclone_options+=(--config "$RCLONE_CONFIG")
+    fi
+fi
 
 [[ -d "$PLEX_DATA_DIR" ]] || die "Plex data directory not found: $PLEX_DATA_DIR"
 mkdir -p -- "$BACKUP_DIR"
@@ -98,4 +125,11 @@ tar -tzf "$partial_file" >/dev/null
 mv -- "$partial_file" "$final_file"
 
 trap - EXIT
-printf 'Backup complete: %s\n' "$final_file"
+printf 'Local backup complete: %s\n' "$final_file"
+
+if [[ -n "$RCLONE_DEST" ]]; then
+    remote_file="${RCLONE_DEST%/}/$(basename -- "$final_file")"
+    printf 'Uploading to %s...\n' "$remote_file"
+    rclone "${rclone_options[@]}" copyto "$final_file" "$remote_file"
+    printf 'Upload complete: %s\n' "$remote_file"
+fi
