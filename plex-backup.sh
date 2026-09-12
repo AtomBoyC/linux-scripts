@@ -3,7 +3,7 @@
 # Back up a native deb/rpm Plex Media Server installation.
 #
 # Usage:
-#   sudo ./plex-backup.sh
+#   sudo bash ./plex-backup.sh
 #
 # Optional environment variables:
 #   PLEX_SERVICE=plexmediaserver
