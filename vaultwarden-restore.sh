@@ -385,12 +385,16 @@ try:
     documents = json.load(sys.stdin)
     if len(documents) != 1:
         raise ValueError("docker inspect did not return exactly one container")
+    config = documents[0].get("Config") or {}
+    working_dir = config.get("WorkingDir") or "/"
+    if not isinstance(working_dir, str):
+        raise ValueError("container working directory is not a string")
     values = {key: "" for key in keys}
-    for entry in documents[0].get("Config", {}).get("Env") or []:
+    for entry in config.get("Env") or []:
         name, delimiter, value = entry.partition("=")
         if delimiter and name in values:
             values[name] = value
-    selected = [values[key] for key in keys]
+    selected = [working_dir] + [values[key] for key in keys]
     if any(separator in value or "\n" in value or "\r" in value
            for value in selected):
         raise ValueError("relevant environment value contains a control character")
@@ -401,10 +405,47 @@ except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as error:
 '
 }
 
+validate_data_folder_path() {
+    local data_folder_value="$1"
+    local working_dir_value="$2"
+    local source_label="$3"
+
+    if ! printf '%s' "$data_folder_value" | \
+        python3 -c '
+import posixpath
+import sys
+
+working_dir, source_label = sys.argv[1:]
+value = sys.stdin.read()
+
+if value != value.strip():
+    print(f"Error: {source_label} contains leading or trailing whitespace", file=sys.stderr)
+    raise SystemExit(1)
+
+if not posixpath.isabs(working_dir):
+    print("Error: restored container working directory is not absolute", file=sys.stderr)
+    raise SystemExit(1)
+if ".." in working_dir.split("/") or ".." in value.split("/"):
+    print(f"Error: {source_label} contains an ambiguous parent path", file=sys.stderr)
+    raise SystemExit(1)
+
+if not posixpath.isabs(value):
+    value = posixpath.join(working_dir, value)
+
+if posixpath.normpath(value) != "/data":
+    print(f"Error: {source_label} does not resolve to /data", file=sys.stderr)
+    raise SystemExit(1)
+' "$working_dir_value" "$source_label"
+    then
+        return 1
+    fi
+}
+
 validate_database_url() {
     local database_url_value="$1"
     local data_folder_value="$2"
-    local source_label="$3"
+    local working_dir_value="$3"
+    local source_label="$4"
 
     [[ -n "$database_url_value" ]] || return 0
 
@@ -413,7 +454,7 @@ validate_database_url() {
 import posixpath
 import sys
 
-data_folder, source_label = sys.argv[1:]
+data_folder, working_dir, source_label = sys.argv[1:]
 value = sys.stdin.read()
 
 if value != value.strip():
@@ -433,15 +474,19 @@ elif ":" in value:
 
 while value.startswith("//"):
     value = value[1:]
-if value.startswith("./"):
-    value = value[2:]
-if not value.startswith("/"):
-    value = "/" + value
+if not posixpath.isabs(working_dir):
+    print("Error: restored container working directory is not absolute", file=sys.stderr)
+    raise SystemExit(1)
+if ".." in working_dir.split("/") or ".." in value.split("/"):
+    print(f"Error: {source_label} contains an ambiguous parent path", file=sys.stderr)
+    raise SystemExit(1)
+if not posixpath.isabs(value):
+    value = posixpath.join(working_dir, value)
 
 if posixpath.normpath(value) != "/data/db.sqlite3":
     print(f"Error: {source_label} does not point to /data/db.sqlite3", file=sys.stderr)
     raise SystemExit(1)
-' "$data_folder_value" "$source_label"
+' "$data_folder_value" "$working_dir_value" "$source_label"
     then
         return 1
     fi
@@ -450,6 +495,7 @@ if posixpath.normpath(value) != "/data/db.sqlite3":
 validate_config_file_path() {
     local config_file_value="$1"
     local data_folder_value="$2"
+    local working_dir_value="$3"
 
     [[ -n "$config_file_value" ]] || return 0
 
@@ -458,7 +504,7 @@ validate_config_file_path() {
 import posixpath
 import sys
 
-data_folder = sys.argv[1]
+data_folder, working_dir = sys.argv[1:]
 value = sys.stdin.read()
 
 if value != value.strip() or "?" in value or "#" in value:
@@ -466,15 +512,19 @@ if value != value.strip() or "?" in value or "#" in value:
     raise SystemExit(1)
 
 value = value.replace("%DATA_FOLDER%", data_folder)
-if value.startswith("./"):
-    value = value[2:]
-if not value.startswith("/"):
-    value = "/" + value
+if not posixpath.isabs(working_dir):
+    print("Error: restored container working directory is not absolute", file=sys.stderr)
+    raise SystemExit(1)
+if ".." in working_dir.split("/") or ".." in value.split("/"):
+    print("Error: restored container CONFIG_FILE contains an ambiguous parent path", file=sys.stderr)
+    raise SystemExit(1)
+if not posixpath.isabs(value):
+    value = posixpath.join(working_dir, value)
 
 if posixpath.normpath(value) != "/data/config.json":
     print("Error: restored container CONFIG_FILE does not point to /data/config.json", file=sys.stderr)
     raise SystemExit(1)
-' "$data_folder_value"
+' "$data_folder_value" "$working_dir_value"
     then
         return 1
     fi
@@ -511,8 +561,33 @@ cleanup() {
         fi
 
         for container_id in "${container_ids[@]}"; do
-            if ! docker rm -f "$container_id" >/dev/null 2>&1 || \
-               docker inspect "$container_id" >/dev/null 2>&1; then
+            if ! candidate_container_id="$(
+                docker inspect --format '{{.Id}}' "$container_id" 2>/dev/null
+            )" || [[ -z "$candidate_container_id" ]]; then
+                container_cleanup_safe=0
+                continue
+            fi
+            if [[ -n "$old_container_id" && \
+                  "$candidate_container_id" == "$old_container_id" ]]; then
+                old_candidate_running="$(
+                    docker inspect --format '{{.State.Running}}' \
+                        "$candidate_container_id" 2>/dev/null
+                )"
+                if [[ "$old_candidate_running" == true ]]; then
+                    if ! docker stop "$candidate_container_id" >/dev/null 2>&1 || \
+                       [[ "$(
+                           docker inspect --format '{{.State.Running}}' \
+                               "$candidate_container_id" 2>/dev/null
+                       )" != false ]]; then
+                        container_cleanup_safe=0
+                    fi
+                elif [[ "$old_candidate_running" != false ]]; then
+                    container_cleanup_safe=0
+                fi
+                continue
+            fi
+            if ! docker rm -f "$candidate_container_id" >/dev/null 2>&1 || \
+               docker inspect "$candidate_container_id" >/dev/null 2>&1; then
                 container_cleanup_safe=0
             fi
         done
@@ -922,10 +997,11 @@ expected_database="$vw_dir/$database_relative"
 if ! environment_settings="$(inspect_vaultwarden_environment "$restored_container_id")"; then
     die 'restored container environment validation failed'
 fi
-IFS=$'\x1f' read -r data_folder database_url config_file_setting env_file_setting \
+IFS=$'\x1f' read -r container_working_dir data_folder database_url \
+    config_file_setting env_file_setting \
     data_folder_file_setting database_url_file_setting config_file_file_setting \
     env_file_file_setting <<< "$environment_settings"
-data_folder="${data_folder:-/data}"
+data_folder="${data_folder:-data}"
 
 [[ -z "$data_folder_file_setting" ]] || \
     die 'DATA_FOLDER_FILE is not supported by this SQLite restore script'
@@ -935,14 +1011,15 @@ data_folder="${data_folder:-/data}"
     die 'CONFIG_FILE_FILE is not supported; put the config path directly in Compose'
 [[ -z "$env_file_file_setting" ]] || \
     die 'ENV_FILE_FILE is not supported by this SQLite restore script'
-case "$data_folder" in
-    /data|/data/|data|data/|./data|./data/) data_folder=/data ;;
-    *) die "unsupported DATA_FOLDER in restored container: $data_folder" ;;
-esac
-validate_database_url "$database_url" "$data_folder" \
+validate_data_folder_path "$data_folder" "$container_working_dir" \
+    'restored container DATA_FOLDER' || \
+    die 'restored container DATA_FOLDER validation failed'
+data_folder=/data
+validate_database_url "$database_url" "$data_folder" "$container_working_dir" \
     'restored container DATABASE_URL' || \
     die 'restored container DATABASE_URL validation failed'
-validate_config_file_path "$config_file_setting" "$data_folder" || \
+validate_config_file_path "$config_file_setting" "$data_folder" \
+    "$container_working_dir" || \
     die 'restored container CONFIG_FILE validation failed'
 [[ -z "$env_file_setting" ]] || \
     die 'restored container ENV_FILE is not supported; put its values directly in Compose'
@@ -977,11 +1054,12 @@ PY
     fi
     IFS=$'\x1f' read -r config_data_folder config_database_url <<< "$config_settings"
     config_data_folder="${config_data_folder:-$data_folder}"
-    case "$config_data_folder" in
-        /data|/data/|data|data/|./data|./data/) config_data_folder=/data ;;
-        *) die "unsupported data_folder in restored config.json: $config_data_folder" ;;
-    esac
+    validate_data_folder_path "$config_data_folder" "$container_working_dir" \
+        'restored config.json data_folder' || \
+        die 'restored config.json data_folder validation failed'
+    config_data_folder=/data
     validate_database_url "$config_database_url" "$config_data_folder" \
+        "$container_working_dir" \
         'restored config.json database_url' || \
         die 'restored config.json database_url validation failed'
 elif [[ -e "$effective_config_source" || -L "$effective_config_source" ]]; then
